@@ -1,6 +1,8 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -14,6 +16,10 @@ import com.fc.v2.service.ITPostQualityRuleService;
 
 /**
  * 服务质量达标率判据线 Service业务层处理（rule-eval 形状）
+ *
+ * “at 时刻生效”只有一个口径 {@link #effective}：未删除、现行、启用之日 ≤ at ＜ 交棒之日
+ * （eff_end 不含）；起止与状态为空的行按存量数据兼容（视为无约束/现行）。定位、列表、
+ * 计数、单条可用性全部复用它，不再各查各的。
  *
  * @author fuce
  * @date 2026-09-14
@@ -36,6 +42,10 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
         }
     };
 
+    /** 达标率百分比合法区间（含端点），越界一律判 0 */
+    private static final BigDecimal RATE_MIN = BigDecimal.ZERO;
+    private static final BigDecimal RATE_MAX = new BigDecimal("100");
+
     @javax.annotation.Resource
     private TPostQualityRuleMapper postQualityRuleMapper;
 
@@ -56,9 +66,18 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
     @Override
     public List<TPostQualityRule> listAvailable(Date at) {
         if (at == null) {
-            return new java.util.ArrayList<TPostQualityRule>();
+            return new ArrayList<TPostQualityRule>();
         }
-        return this.postQualityRuleMapper.selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0));
+        List<TPostQualityRule> all = this.postQualityRuleMapper
+                .selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0));
+        List<TPostQualityRule> avail = new ArrayList<TPostQualityRule>();
+        for (TPostQualityRule r : all) {
+            if (effective(r, at)) {
+                avail.add(r);
+            }
+        }
+        Collections.sort(avail, PRIORITY_THEN_CODE_DESC);
+        return avail;
     }
 
     @Override
@@ -75,8 +94,7 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
         if (input == null || at == null) {
             return 0;
         }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        if (input.compareTo(RATE_MIN) < 0 || input.compareTo(RATE_MAX) > 0) {
             return 0;
         }
         List<TPostQualityRule> avail = listAvailable(at);
@@ -92,57 +110,84 @@ public class TPostQualityRuleServiceImpl implements ITPostQualityRuleService {
             return false;
         }
         TPostQualityRule r = this.postQualityRuleMapper.selectById(id);
-        return r != null;
+        return r != null && effective(r, at);
     }
 
     @Override
     public int countAvailable(Date at) {
-        if (at == null) {
-            return 0;
-        }
-        return this.postQualityRuleMapper
-                .selectList(new QueryWrapper<TPostQualityRule>().eq("del_flag", 0)).size();
+        // 与列表同源：统计的就是 listAvailable 的条数，不另写一套查询
+        return listAvailable(at).size();
     }
 
+    /**
+     * 生效口径（全服务唯一出处）：
+     * del_flag 空或 0、status 空或 0现行、eff_start 空或 ≤ at、eff_end 空或 ＞ at（不含交棒日）。
+     */
+    private boolean effective(TPostQualityRule r, Date at) {
+        if (r == null) {
+            return false;
+        }
+        if (r.getDelFlag() != null && r.getDelFlag() != 0) {
+            return false;
+        }
+        if (r.getStatus() != null && r.getStatus() != 0) {
+            return false;
+        }
+        if (r.getEffStart() != null && ts(at).compareTo(ts(r.getEffStart())) < 0) {
+            return false;
+        }
+        if (r.getEffEnd() != null && ts(at).compareTo(ts(r.getEffEnd())) >= 0) {
+            return false;
+        }
+        return true;
+    }
+
+    /** 按代号取 at 时刻生效版本；多个重叠时以启用之日最新者为准，并列取 id 大的（确定性） */
     private TPostQualityRule findRule(String ruleCode, Date at) {
         List<TPostQualityRule> hit = this.postQualityRuleMapper.selectList(new QueryWrapper<TPostQualityRule>()
                 .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TPostQualityRule newest = null;
+        TPostQualityRule picked = null;
         for (TPostQualityRule r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+            if (!effective(r, at)) {
+                continue;
+            }
+            if (picked == null) {
+                picked = r;
+                continue;
+            }
+            Date s1 = r.getEffStart();
+            Date s0 = picked.getEffStart();
+            boolean newer = s1 != null && (s0 == null || s1.after(s0));
+            boolean sameStart = (s1 == null && s0 == null) || (s1 != null && s1.equals(s0));
+            if (newer || (sameStart && r.getId() != null
+                    && (picked.getId() == null || r.getId() > picked.getId()))) {
+                picked = r;
             }
         }
-        return newest;
+        return picked;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TPostQualityRule r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
-        }
-        if (tier == 2) {
-            return r.getTh2Max();
-        }
-        return r.getTh3Max();
-    }
-
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TPostQualityRule r, int tier) {
-        return r.getTh1Max();
-    }
-
-    /** 分档：等于上限取高一档 */
+    /**
+     * 分档：等于上限取高一档。阈值必须按 1→2→3 齐全，缺一或输入越界按“无法判档”返回 0。
+     */
     private int levelOf(TPostQualityRule rule, BigDecimal input) {
-        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
+        if (rule == null || input == null
+                || input.compareTo(RATE_MIN) < 0 || input.compareTo(RATE_MAX) > 0) {
+            return 0;
+        }
+        BigDecimal t1 = rule.getTh1Max();
+        BigDecimal t2 = rule.getTh2Max();
+        BigDecimal t3 = rule.getTh3Max();
+        if (t1 == null || t2 == null || t3 == null) {
+            return 0;
+        }
+        if (input.compareTo(t1) <= 0) {
             return 1;
         }
-        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) <= 0) {
+        if (input.compareTo(t2) <= 0) {
             return 2;
         }
-        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
+        if (input.compareTo(t3) <= 0) {
             return 3;
         }
         return 4;

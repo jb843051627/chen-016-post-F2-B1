@@ -22,6 +22,9 @@ import org.springframework.stereotype.Service;
 /**
  * 快递末端网点备案建档卡Service业务层处理
  *
+ * 底档取数只有一处：{@link #resolveUsableArch} 同时负责“在册未注销”校验、字号回填与件量
+ * 分档换算，新增和修改两个入口都走它，不再一个入口带在册/删除条件、另一个入口裸取。
+ *
  * @author fuce
  * @date 2026-09-12
  */
@@ -40,10 +43,8 @@ public class TPostOutletCardServiceImpl extends ServiceImpl<TPostOutletCardMappe
 
     @Override
     public List<TPostOutletCard> selectTPostOutletCardList(Wrapper<TPostOutletCard> queryWrapper) {
-        QueryWrapper<TPostOutletCard> wrapper = new QueryWrapper<TPostOutletCard>();
-        com.github.pagehelper.PageHelper.startPage(1, 10);
-        wrapper.eq("status", 0);
-        return this.baseMapper.selectList(wrapper);
+        // 分页由控制器 startPage() 决定，这里不另写死页码，也不吞掉调用方的查询条件
+        return this.baseMapper.selectList(queryWrapper);
     }
 
     @Override
@@ -53,38 +54,14 @@ public class TPostOutletCardServiceImpl extends ServiceImpl<TPostOutletCardMappe
         }
 
         record.setCreateBy(record.getBillNo());
-        TPostCompanyArch refArch = postCompanyArchMapper.selectOne(new QueryWrapper<TPostCompanyArch>()
-                .eq("id", record.getSiteId()).eq("del_flag", 0));
+        TPostCompanyArch refArch = resolveUsableArch(record.getSiteId());
         if (refArch == null) {
             return 0;
         }
-        if (refArch.getStatus() != null && refArch.getStatus() == 1) {
+        if (isDuplicateBillNo(record.getBillNo(), null)) {
             return 0;
         }
-        record.setSiteNo(refArch.getSiteNo());
-        if (StringUtils.isNotEmpty(record.getBillNo())) {
-            Integer dupCnt = this.baseMapper.selectCount(new QueryWrapper<TPostOutletCard>()
-                    .eq("bill_no", record.getBillNo()).eq("del_flag", 0));
-            if (dupCnt != null && dupCnt > 0) {
-                return 0;
-            }
-        }
-        TPostCompanyArch bandArch = postCompanyArchMapper.selectById(record.getSiteId());
-        BigDecimal bandVal = record.getQty();
-        int bandLevel = 0;
-        if (bandVal != null && bandArch != null) {
-            if (bandVal.compareTo(bandArch.getTh1Max()) <= 0) {
-                bandLevel = 1;
-            } else if (bandVal.compareTo(bandArch.getTh2Max()) <= 0) {
-                bandLevel = 2;
-            } else if (bandVal.compareTo(bandArch.getTh3Max()) <= 0) {
-                bandLevel = 3;
-            } else {
-                bandLevel = 4;
-            }
-        }
-        record.setGradeLevel(bandLevel);
-
+        applyArch(record, refArch);
         record.setDelFlag(0);
         return this.baseMapper.insert(record);
     }
@@ -95,13 +72,15 @@ public class TPostOutletCardServiceImpl extends ServiceImpl<TPostOutletCardMappe
             return 0;
         }
 
-        if (record.getId() != null && StringUtils.isNotEmpty(record.getBillNo())) {
-            Integer dupCnt = this.baseMapper.selectCount(new QueryWrapper<TPostOutletCard>()
-                    .eq("bill_no", record.getBillNo()).ne("id", record.getId()).eq("del_flag", 0));
-            if (dupCnt != null && dupCnt > 0) {
-                return 0;
-            }
+        if (isDuplicateBillNo(record.getBillNo(), record.getId())) {
+            return 0;
         }
+        // 与新增同一口径：底档在册才放行，件量/企业有变动时分档随之重算
+        TPostCompanyArch refArch = resolveUsableArch(record.getSiteId());
+        if (refArch == null) {
+            return 0;
+        }
+        applyArch(record, refArch);
 
         record.setUpdateTime(new Date());
         return this.baseMapper.update(record, new UpdateWrapper<TPostOutletCard>()
@@ -118,5 +97,61 @@ public class TPostOutletCardServiceImpl extends ServiceImpl<TPostOutletCardMappe
     @Override
     public int deleteTPostOutletCardById(Long id) {
         return this.baseMapper.deleteById(id);
+    }
+
+    /** 取在册（del_flag=0 且 status!=1 注销）底档；不存在或已注销返回 null。全服务唯一底档取数点 */
+    private TPostCompanyArch resolveUsableArch(Integer siteId) {
+        if (siteId == null) {
+            return null;
+        }
+        TPostCompanyArch arch = postCompanyArchMapper.selectOne(new QueryWrapper<TPostCompanyArch>()
+                .eq("id", siteId).eq("del_flag", 0));
+        if (arch == null) {
+            return null;
+        }
+        if (arch.getStatus() != null && arch.getStatus() == 1) {
+            return null;
+        }
+        return arch;
+    }
+
+    /** 字号回填 + 件量分档，新增/修改共用，换算口径只有这一处 */
+    private void applyArch(TPostOutletCard record, TPostCompanyArch arch) {
+        record.setSiteNo(arch.getSiteNo());
+        record.setGradeLevel(gradeLevelOf(record.getQty(), arch));
+    }
+
+    /**
+     * 日均件量按底档三线上限折序位，等于上限取高一序位（30/90/240 → 1..4）。
+     * 件量为空或阈值未维护齐时无法换算，返回 null，不臆造档位。
+     */
+    private Integer gradeLevelOf(BigDecimal qty, TPostCompanyArch arch) {
+        if (qty == null || arch.getTh1Max() == null
+                || arch.getTh2Max() == null || arch.getTh3Max() == null) {
+            return null;
+        }
+        if (qty.compareTo(arch.getTh1Max()) <= 0) {
+            return 1;
+        }
+        if (qty.compareTo(arch.getTh2Max()) <= 0) {
+            return 2;
+        }
+        if (qty.compareTo(arch.getTh3Max()) <= 0) {
+            return 3;
+        }
+        return 4;
+    }
+
+    private boolean isDuplicateBillNo(String billNo, Long excludeId) {
+        if (StringUtils.isEmpty(billNo)) {
+            return false;
+        }
+        QueryWrapper<TPostOutletCard> wrapper = new QueryWrapper<TPostOutletCard>()
+                .eq("bill_no", billNo).eq("del_flag", 0);
+        if (excludeId != null) {
+            wrapper.ne("id", excludeId);
+        }
+        Integer dupCnt = this.baseMapper.selectCount(wrapper);
+        return dupCnt != null && dupCnt > 0;
     }
 }
