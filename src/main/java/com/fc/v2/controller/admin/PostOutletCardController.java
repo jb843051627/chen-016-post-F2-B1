@@ -7,6 +7,7 @@ import com.fc.v2.common.domain.ResultTable;
 import com.fc.v2.common.log.Log;
 import com.fc.v2.model.auto.TPostOutletCard;
 import com.fc.v2.service.ITPostOutletCardService;
+import com.fc.v2.util.StringUtils;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import org.apache.shiro.authz.annotation.RequiresPermissions;
@@ -44,7 +45,12 @@ public class PostOutletCardController extends BaseController {
     @RequiresPermissions("post:postOutletCard:list")
     @ResponseBody
     public ResultTable list(TPostOutletCard record) {
+        // 查询条件在入口一处拼装（卡号模糊、状态精确），service 不再各搞一套
         QueryWrapper<TPostOutletCard> queryWrapper = new QueryWrapper<TPostOutletCard>();
+        queryWrapper.like(StringUtils.isNotEmpty(record.getBillNo()), "bill_no", record.getBillNo());
+        queryWrapper.eq(record.getStatus() != null, "status", record.getStatus());
+        queryWrapper.orderByDesc("create_time");
+
         startPage();
         com.github.pagehelper.PageInfo<TPostOutletCard> page =
                 new com.github.pagehelper.PageInfo<TPostOutletCard>(postOutletCardService.selectTPostOutletCardList(queryWrapper));
